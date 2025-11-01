@@ -884,7 +884,7 @@ export default {
           const blockList = blockedUsers.results.length > 0 
             ? blockedUsers.results.map(row => row.chat_id).join('\n')
             : '当前没有被拉黑的用户。';
-          await sendMessageToTopic(topicId, `黑名单列表：\n${nickname}${blockList}`);
+          await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
         } else if (action === 'toggle_user_raw') {
           const currentState = (await getSetting('user_raw_enabled', env.D1)) === 'true';
           const newState = !currentState;
