@@ -583,12 +583,12 @@ export default {
 
     async function getVerificationSuccessMessage() {
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-      if (!userRawEnabled) return '验证成功！您现在可以与我聊天。';
+      if (!userRawEnabled) return '验证成功！';
 
       const response = await fetch('https://raw.githubusercontent.com/wuyangdaily/ctt/refs/heads/main/CFTeleTrans/start.md');
-      if (!response.ok) return '验证成功！您现在可以与我聊天。';
+      if (!response.ok) return '验证成功！';
       const message = await response.text();
-      return message.trim() || '验证成功！您现在可以与我聊天。';
+      return message.trim() || '验证成功！';
     }
 
     async function getNotificationContent() {
