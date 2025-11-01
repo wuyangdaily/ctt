@@ -554,10 +554,6 @@ export default {
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
         ],
         [
-          { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
-          { text: 'GitHub项目', url: 'https://github.com/wuyangdaily/ctt' }
-        ],
-        [
           { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
         ]
       ];
