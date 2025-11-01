@@ -1112,24 +1112,44 @@ export default {
       if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
       const topicId = data.result.message_thread_id;
 
-      const now = new Date();
+      // 将时间格式化为北京时间（Asia/Shanghai）
+function formatBeijing(date = new Date()) {
+  const df = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
 
-      // 格式化为北京时间（本地时间）
-      const year   = now.getFullYear();
-      const month  = String(now.getMonth() + 1).padStart(2, '0');
-      const day    = String(now.getDate()).padStart(2, '0');
-      const hour   = String(now.getHours()).padStart(2, '0');
-      const minute = String(now.getMinutes()).padStart(2, '0');
-      const second = String(now.getSeconds()).padStart(2, '0');
+  const parts = df.formatToParts(date);
+  const map = {};
+  parts.forEach(p => { if (p.type !== 'literal') map[p.type] = p.value; });
 
-      const formattedTime = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+  // 返回 "YYYY-MM-DD HH:mm:ss"
+  return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
+}
 
-      const notificationContent = await getNotificationContent();
-      const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+// ----- 你的原代码片段（只替换时间部分） -----
+(async () => {
+  try {
+    // 取得北京时间字符串
+    const formattedTime = formatBeijing();
 
-      const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-      const messageId = messageResponse.result.message_id;
-      await pinMessage(topicId, messageId);
+    const notificationContent = await getNotificationContent();
+    const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+    const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
+    const messageId = messageResponse.result.message_id;
+    await pinMessage(topicId, messageId);
+  } catch (err) {
+    console.error('发送/置顶消息出错：', err);
+    throw err;
+  }
+})();
+
 
       return topicId;
     }
