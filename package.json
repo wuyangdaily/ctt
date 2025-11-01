@@ -7,7 +7,7 @@
     "generate-star-chart": "node scripts/generate-star-chart.js"
   },
   "keywords": ["telegram", "bot", "cloudflare"],
-  "author": "iawooo",
+  "author": "wuyangdaily",
   "license": "ISC",
   "dependencies": {
     "node-fetch": "^2.7.0",
