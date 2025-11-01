@@ -1113,9 +1113,20 @@ export default {
       const topicId = data.result.message_thread_id;
 
       const now = new Date();
-      const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
+
+      // 格式化为北京时间（本地时间）
+      const year   = now.getFullYear();
+      const month  = String(now.getMonth() + 1).padStart(2, '0');
+      const day    = String(now.getDate()).padStart(2, '0');
+      const hour   = String(now.getHours()).padStart(2, '0');
+      const minute = String(now.getMinutes()).padStart(2, '0');
+      const second = String(now.getSeconds()).padStart(2, '0');
+
+      const formattedTime = `${year}-${month}-${day} ${hour}:${minute}:${second}`;
+
       const notificationContent = await getNotificationContent();
       const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+
       const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
       const messageId = messageResponse.result.message_id;
       await pinMessage(topicId, messageId);
