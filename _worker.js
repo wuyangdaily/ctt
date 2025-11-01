@@ -820,7 +820,7 @@ export default {
             .run();
 
           const successMessage = await getVerificationSuccessMessage();
-          await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人！现在可以发送消息了。`);
+          await sendMessageToUser(chatId, `${successMessage}\n你可以用这个机器人跟我对话。写下您想要发送的消息（图片、视频），我会尽快回复您！`);
           const userInfo = await getUserInfo(chatId);
           await ensureUserTopic(chatId, userInfo);
         } else {
