@@ -554,7 +554,7 @@ export default {
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
         ],
         [
-          { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
+          { text: '删除会话', callback_data: `delete_user_${privateChatId}` }
         ]
       ];
 
