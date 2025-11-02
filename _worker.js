@@ -315,7 +315,7 @@ export default {
       }
 
       if (userState.is_blocked) {
-        await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。请联系管理员解除拉黑。");
+        await sendMessageToUser(chatId, "您已被拉黑，无法发送消息！");
         return;
       }
 
