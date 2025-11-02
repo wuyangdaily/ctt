@@ -887,15 +887,54 @@ export default {
           await setSetting('user_raw_enabled', newState.toString());
           await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
         } else if (action === 'delete_user') {
+          // ------------------ 修改开始 ------------------
+          // goal: 删除用户时同时删除对应的话题（如果存在）
+          try {
+            // 先查找该 privateChatId 对应的 topicId（从 cache 或 DB）
+            const userTopicId = await getExistingTopicId(privateChatId);
+            if (userTopicId) {
+              try {
+                // deleteForumTopic 需要 bot 有管理话题/删除的权限
+                const delResp = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteForumTopic`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    chat_id: GROUP_ID,
+                    message_thread_id: Number(userTopicId)
+                  })
+                });
+                const delData = await delResp.json().catch(() => ({ ok: false, description: 'invalid json' }));
+                if (!delData.ok) {
+                  console.log(`删除话题 ${userTopicId} 失败: ${delData.description || JSON.stringify(delData)}`);
+                } else {
+                  console.log(`话题 ${userTopicId} 删除成功`);
+                }
+              } catch (err) {
+                console.log(`调用 deleteForumTopic 出错: ${err.message}`);
+                // 不要因为 API 调用失败就放弃后续的 DB 清理
+              }
+            } else {
+              console.log(`未找到用户 ${privateChatId} 的话题映射，跳过删除话题步骤`);
+            }
+          } catch (err) {
+            console.log(`查找 topicId 出错: ${err.message}`);
+            // 继续执行删除 user 数据
+          }
+
+          // 清理缓存并从数据库删除用户相关记录
           userStateCache.set(privateChatId, undefined);
           messageRateCache.set(privateChatId, undefined);
           topicIdCache.set(privateChatId, undefined);
+
           await env.D1.batch([
             env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(privateChatId),
             env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId),
             env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
           ]);
+
+          // 向管理员面板所在的 topic 发送反馈（注意这里使用的是管理员面板的 topicId 变量）
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
+          // ------------------ 修改结束 ------------------
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
         }
