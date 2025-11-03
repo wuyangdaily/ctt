@@ -1,4 +1,3 @@
-// Telegram 双向机器人 — 完整代码（含 5 次错判封禁、24h 无交互删话题、管理员私聊面板、可读剩余时间）
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
