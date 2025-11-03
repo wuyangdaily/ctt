@@ -11,8 +11,7 @@ const processedCallbacks = new Set();
 const topicCreationLocks = new Map();
 
 const settingsCache = new Map([
-  ['verification_enabled', null],
-  ['user_raw_enabled', null]
+  ['verification_enabled', null]
 ]);
 
 class LRUCache {
@@ -215,13 +214,10 @@ export default {
 
       await Promise.all([
         d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('verification_enabled', 'true').run(),
-        d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('user_raw_enabled', 'true').run()
+          .bind('verification_enabled', 'true').run()
       ]);
 
       settingsCache.set('verification_enabled', (await getSetting('verification_enabled', d1)) === 'true');
-      settingsCache.set('user_raw_enabled', (await getSetting('user_raw_enabled', d1)) === 'true');
     }
 
     async function createTable(d1, tableName, structure) {
@@ -542,7 +538,6 @@ export default {
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
 
       const buttons = [
         [
@@ -552,10 +547,6 @@ export default {
         [
           { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
-        ],
-        [
-          { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
-          { text: 'GitHub项目', url: 'https://github.com/wuyangdaily/ctt' }
         ],
         [
           { text: '删除会话', callback_data: `delete_user_${privateChatId}` }
@@ -586,13 +577,7 @@ export default {
     }
 
     async function getVerificationSuccessMessage() {
-      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-      if (!userRawEnabled) return '验证成功。';
-
-      const response = await fetch('https://raw.githubusercontent.com/wuyangdaily/ctt/refs/heads/main/CFTeleTrans/start.md');
-      if (!response.ok) return '验证成功。';
-      const message = await response.text();
-      return message.trim() || '验证成功。';
+      return '验证成功。';
     }
 
     async function getNotificationContent() {
@@ -691,8 +676,6 @@ export default {
             .run();
           userStateCache.clear();
         }
-      } else if (key === 'user_raw_enabled') {
-        settingsCache.set('user_raw_enabled', value === 'true');
       }
     }
 
@@ -718,9 +701,6 @@ export default {
       } else if (data.startsWith('toggle_verification_')) {
         action = 'toggle_verification';
         privateChatId = parts.slice(2).join('_');
-      } else if (data.startsWith('toggle_user_raw_')) {
-        action = 'toggle_user_raw';
-        privateChatId = parts.slice(3).join('_');
       } else if (data.startsWith('check_blocklist_')) {
         action = 'check_blocklist';
         privateChatId = parts.slice(2).join('_');
@@ -885,11 +865,6 @@ export default {
             ? blockedUsers.results.map(row => row.chat_id).join('\n')
             : '当前没有被拉黑的用户。';
           await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
-        } else if (action === 'toggle_user_raw') {
-          const currentState = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-          const newState = !currentState;
-          await setSetting('user_raw_enabled', newState.toString());
-          await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
         } else if (action === 'delete_user') {
           userStateCache.set(privateChatId, undefined);
           messageRateCache.set(privateChatId, undefined);
