@@ -315,7 +315,7 @@ export default {
       }
 
       if (userState.is_blocked) {
-        await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。请联系管理员解除拉黑。");
+        await sendMessageToUser(chatId, "您已被拉黑，无法发送消息。");
         return;
       }
 
@@ -412,7 +412,7 @@ export default {
         }
 
         const successMessage = await getVerificationSuccessMessage();
-        await sendMessageToUser(chatId, `${successMessage}\n你好，欢迎使用私聊机器人，现在发送信息吧！`);
+        await sendMessageToUser(chatId, `${successMessage}\n你可以用这个机器人跟我对话。写下您想要发送的消息（图片、视频），我会尽快回复您！`);
         const userInfo = await getUserInfo(chatId);
         await ensureUserTopic(chatId, userInfo);
         return;
@@ -558,7 +558,7 @@ export default {
           { text: 'GitHub项目', url: 'https://github.com/wuyangdaily/ctt' }
         ],
         [
-          { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
+          { text: '删除会话', callback_data: `delete_user_${privateChatId}` }
         ]
       ];
 
