@@ -1092,7 +1092,10 @@ export default {
       const topicId = data.result.message_thread_id;
 
       const now = new Date();
-      const formattedTime = now.toISOString().replace('T', ' ').substring(0, 19);
+      const formattedTime = new Date().toLocaleString('zh-CN', {
+        hour12: false,
+        timeZone: 'Asia/Shanghai'
+      }).replace(/\//g, '-');      
       const notificationContent = await getNotificationContent();
       const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
       const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
