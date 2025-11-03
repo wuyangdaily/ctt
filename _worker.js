@@ -1,3 +1,4 @@
+// Telegram 双向机器人 — 完整代码（含 5 次错判封禁、24h 无交互删话题、管理员私聊面板、可读剩余时间）
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
@@ -45,6 +46,59 @@ const topicIdCache = new LRUCache(1000);
 const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
 
+// ---------- 时间与日志工具 ----------
+function formatShanghai(date = new Date()) {
+  const df = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  });
+  const parts = df.formatToParts(date);
+  const map = {};
+  parts.forEach(p => { if (p.type !== 'literal') map[p.type] = p.value; });
+  return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
+}
+
+/**
+ * 将剩余秒数格式化为中文友好表达（精确到秒）
+ * examples:
+ *  - 3663 -> "还剩 1 小时 1 分钟 3 秒"
+ *  - 3600 -> "还剩 1 小时"
+ *  - 125  -> "还剩 2 分钟 5 秒"
+ *  - 30   -> "还剩 30 秒"
+ *  - 0    -> "已到期"
+ */
+function formatRemainingTime(seconds) {
+  if (!seconds || seconds <= 0) return '已到期';
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  const secs = Math.floor(seconds % 60);
+  const parts = [];
+  if (hrs > 0) parts.push(`${hrs} 小时`);
+  if (mins > 0) parts.push(`${mins} 分钟`);
+  if (secs > 0) parts.push(`${secs} 秒`);
+  if (parts.length === 0) return '还剩不到1秒';
+  return `还剩 ${parts.join(' ')}`;
+}
+
+function logger(level, message, meta) {
+  const ts = formatShanghai();
+  const metaStr = meta ? ` | ${typeof meta === 'string' ? meta : JSON.stringify(meta)}` : '';
+  if (level === 'ERROR') {
+    console.error(`[${ts}] [${level}] ${message}${metaStr}`);
+  } else if (level === 'WARN') {
+    console.warn(`[${ts}] [${level}] ${message}${metaStr}`);
+  } else {
+    console.log(`[${ts}] [${level}] ${message}${metaStr}`);
+  }
+}
+// ---------- end 时间与日志 ----------
+
 export default {
   async fetch(request, env) {
     BOT_TOKEN = env.BOT_TOKEN_ENV || null;
@@ -72,6 +126,7 @@ export default {
           await handleUpdate(update);
           return new Response('OK');
         } catch (error) {
+          logger('ERROR', 'Invalid webhook request', error.message);
           return new Response('Bad Request', { status: 400 });
         }
       } else if (url.pathname === '/registerWebhook') {
@@ -80,6 +135,7 @@ export default {
         return await unRegisterWebhook();
       } else if (url.pathname === '/checkTables') {
         await checkAndRepairTables(env.D1);
+        await Promise.all([cleanExpiredVerificationCodes(env.D1), cleanInactiveTopics(env.D1)]);
         return new Response('Database tables checked and repaired', { status: 200 });
       }
       return new Response('Not Found', { status: 404 });
@@ -90,17 +146,24 @@ export default {
         checkAndRepairTables(d1),
         autoRegisterWebhook(request),
         checkBotPermissions(),
-        cleanExpiredVerificationCodes(d1)
+        cleanExpiredVerificationCodes(d1),
+        cleanInactiveTopics(d1)
       ]);
+      logger('INFO', 'Initialization complete');
     }
 
     async function autoRegisterWebhook(request) {
       const webhookUrl = `${new URL(request.url).origin}/webhook`;
-      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: webhookUrl }),
-      });
+      try {
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: webhookUrl }),
+        });
+        logger('INFO', 'Auto-registered webhook', webhookUrl);
+      } catch (e) {
+        logger('WARN', 'Failed to auto-register webhook', e.message);
+      }
     }
 
     async function checkBotPermissions() {
@@ -126,6 +189,7 @@ export default {
       if (!memberData.ok) {
         throw new Error(`Failed to get bot member status: ${memberData.description}`);
       }
+      logger('INFO', 'Bot permissions checked');
     }
 
     async function getBotId() {
@@ -152,7 +216,9 @@ export default {
             last_verification_message_id: 'TEXT',
             is_first_verification: 'BOOLEAN DEFAULT TRUE',
             is_rate_limited: 'BOOLEAN DEFAULT FALSE',
-            is_verifying: 'BOOLEAN DEFAULT FALSE'
+            is_verifying: 'BOOLEAN DEFAULT FALSE',
+            verification_fail_count: 'INTEGER DEFAULT 0',
+            verification_fail_block_until: 'INTEGER'
           }
         },
         message_rates: {
@@ -167,7 +233,9 @@ export default {
         chat_topic_mappings: {
           columns: {
             chat_id: 'TEXT PRIMARY KEY',
-            topic_id: 'TEXT NOT NULL'
+            topic_id: 'TEXT NOT NULL',
+            created_at: 'INTEGER',
+            last_interaction: 'INTEGER'
           }
         },
         settings: {
@@ -185,13 +253,14 @@ export default {
 
         if (!tableInfo) {
           await createTable(d1, tableName, structure);
+          logger('INFO', `Created missing table ${tableName}`);
           continue;
         }
 
         const columnsResult = await d1.prepare(
           `PRAGMA table_info(${tableName})`
         ).all();
-        
+
         const currentColumns = new Map(
           columnsResult.results.map(col => [col.name, {
             type: col.type,
@@ -202,9 +271,13 @@ export default {
 
         for (const [colName, colDef] of Object.entries(structure.columns)) {
           if (!currentColumns.has(colName)) {
-            const columnParts = colDef.split(' ');
-            const addColumnSQL = `ALTER TABLE ${tableName} ADD COLUMN ${colName} ${columnParts.slice(1).join(' ')}`;
-            await d1.exec(addColumnSQL);
+            try {
+              const addColumnSQL = `ALTER TABLE ${tableName} ADD COLUMN ${colName} ${colDef}`;
+              await d1.exec(addColumnSQL);
+              logger('INFO', `Added column ${colName} to ${tableName}`);
+            } catch (err) {
+              logger('WARN', `Failed to add column ${colName} to ${tableName}`, err.message);
+            }
           }
         }
 
@@ -222,6 +295,8 @@ export default {
 
       settingsCache.set('verification_enabled', (await getSetting('verification_enabled', d1)) === 'true');
       settingsCache.set('user_raw_enabled', (await getSetting('user_raw_enabled', d1)) === 'true');
+
+      logger('INFO', 'checkAndRepairTables finished');
     }
 
     async function createTable(d1, tableName, structure) {
@@ -251,23 +326,69 @@ export default {
             ).bind(chat_id)
           )
         );
+        logger('INFO', `Cleaned ${expiredCodes.results.length} expired verification codes`);
       }
       lastCleanupTime = now;
     }
 
+    async function cleanInactiveTopics(d1) {
+      try {
+        const now = Date.now();
+        const cutoff = now - 24 * 60 * 60 * 1000;
+        const rows = await d1.prepare('SELECT chat_id, topic_id, created_at, last_interaction FROM chat_topic_mappings WHERE created_at IS NOT NULL').all();
+        const toDelete = rows.results.filter(r => r.created_at && r.last_interaction && (r.created_at <= cutoff) && (r.last_interaction === r.created_at));
+        if (toDelete.length === 0) return;
+        logger('INFO', `Found ${toDelete.length} inactive topics to delete`);
+
+        for (const row of toDelete) {
+          const topicId = row.topic_id;
+          const chatId = row.chat_id;
+          try {
+            const delResp = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteForumTopic`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: GROUP_ID,
+                message_thread_id: Number(topicId)
+              })
+            });
+            const delData = await delResp.json().catch(() => ({ ok: false, description: 'invalid json' }));
+            if (!delData.ok) {
+              logger('WARN', `Failed to delete forum topic ${topicId}`, delData.description || JSON.stringify(delData));
+            } else {
+              logger('INFO', `Deleted inactive topic ${topicId}`);
+            }
+          } catch (err) {
+            logger('WARN', `deleteForumTopic error for ${topicId}`, err.message);
+          } finally {
+            await d1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
+            topicIdCache.set(chatId, undefined);
+            logger('INFO', `Cleaned DB mapping for chat ${chatId}`);
+          }
+        }
+      } catch (err) {
+        logger('ERROR', 'cleanInactiveTopics error', err.message);
+      }
+    }
+
     async function handleUpdate(update) {
+      await Promise.all([cleanExpiredVerificationCodes(env.D1), cleanInactiveTopics(env.D1)]).catch((e) => {
+        logger('WARN', 'Periodic cleanup error', e.message);
+      });
+
       if (update.message) {
         const messageId = update.message.message_id.toString();
         const chatId = update.message.chat.id.toString();
         const messageKey = `${chatId}:${messageId}`;
-        
+
         if (processedMessages.has(messageKey)) {
           return;
         }
         processedMessages.add(messageKey);
-        
+
         if (processedMessages.size > 10000) {
           processedMessages.clear();
+          logger('DEBUG', 'processedMessages cache cleared to free memory');
         }
 
         await onMessage(update.message);
@@ -295,6 +416,7 @@ export default {
           }
           if (privateChatId) {
             await forwardMessageToPrivateChat(privateChatId, message);
+            return;
           }
         }
         return;
@@ -302,13 +424,13 @@ export default {
 
       let userState = userStateCache.get(chatId);
       if (userState === undefined) {
-        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+        userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_fail_count, verification_fail_block_until FROM user_states WHERE chat_id = ?')
           .bind(chatId)
           .first();
         if (!userState) {
-          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
-          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying) VALUES (?, ?, ?, ?, ?)')
-            .bind(chatId, false, true, false, false)
+          userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false, verification_fail_count: 0, verification_fail_block_until: null };
+          await env.D1.prepare('INSERT INTO user_states (chat_id, is_blocked, is_first_verification, is_verified, is_verifying, verification_fail_count) VALUES (?, ?, ?, ?, ?, ?)')
+            .bind(chatId, false, true, false, false, 0)
             .run();
         }
         userStateCache.set(chatId, userState);
@@ -319,102 +441,119 @@ export default {
         return;
       }
 
+      let isAdmin = false;
+      try {
+        if (message.chat && message.chat.type === 'private') {
+          isAdmin = await checkIfAdmin(Number(chatId));
+        }
+      } catch (err) {
+        logger('WARN', 'checkIfAdmin failed', err.message);
+      }
+
+      if (text === '/admin' && message.chat && message.chat.type === 'private' && isAdmin) {
+        await sendPrivateAdminPanel(chatId);
+        return;
+      }
+
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
 
-      if (!verificationEnabled) {
-        // 验证码关闭时，所有用户都可以直接发送消息
-      } else {
-        const nowSeconds = Math.floor(Date.now() / 1000);
-        const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
-        const isFirstVerification = userState.is_first_verification;
-        const isRateLimited = await checkMessageRate(chatId);
-        const isVerifying = userState.is_verifying || false;
+      if (!isAdmin) {
+        if (!verificationEnabled) {
+          // 验证关闭，直接通过
+        } else {
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          const isVerified = userState.is_verified && userState.verified_expiry && nowSeconds < userState.verified_expiry;
+          const isFirstVerification = userState.is_first_verification;
+          const isRateLimited = await checkMessageRate(chatId);
+          const isVerifying = userState.is_verifying || false;
 
-        if (!isVerified || (isRateLimited && !isFirstVerification)) {
-          if (isVerifying) {
-            // 检查验证码是否已过期
-            const storedCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
-              .bind(chatId)
-              .first();
-            
-            const nowSeconds = Math.floor(Date.now() / 1000);
-            const isCodeExpired = !storedCode?.verification_code || !storedCode?.code_expiry || nowSeconds > storedCode.code_expiry;
-            
-            if (isCodeExpired) {
-              // 如果验证码已过期，重新发送验证码
-              await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
-              await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
-                .bind(chatId)
-                .run();
-              userStateCache.set(chatId, { ...userState, verification_code: null, code_expiry: null, is_verifying: false });
-              
-              // 删除旧的验证消息（如果存在）
-              try {
-                const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
-                  .bind(chatId)
-                  .first();
-                
-                if (lastVerification?.last_verification_message_id) {
-                  try {
-                    await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        chat_id: chatId,
-                        message_id: lastVerification.last_verification_message_id
-                      })
-                    });
-                  } catch (deleteError) {
-                    console.log(`删除旧验证消息失败: ${deleteError.message}`);
-                    // 删除失败仍继续处理
-                  }
-                  
-                  await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
-                    .bind(chatId)
-                    .run();
-                }
-              } catch (error) {
-                console.log(`查询旧验证消息失败: ${error.message}`);
-                // 即使出错也继续处理
-              }
-              
-              // 立即发送新的验证码
-              try {
-                await handleVerification(chatId, 0);
-              } catch (verificationError) {
-                console.error(`发送新验证码失败: ${verificationError.message}`);
-                // 如果发送验证码失败，则再次尝试
-                setTimeout(async () => {
-                  try {
-                    await handleVerification(chatId, 0);
-                  } catch (retryError) {
-                    console.error(`重试发送验证码仍失败: ${retryError.message}`);
-                    await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
-                  }
-                }, 1000);
-              }
-              return;
-            } else {
-              await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
-            }
+          if (userState.verification_fail_block_until && nowSeconds < userState.verification_fail_block_until) {
+            const remainingSec = userState.verification_fail_block_until - nowSeconds;
+            const remainingFriendly = formatRemainingTime(remainingSec);
+            const untilStr = formatShanghai(new Date(userState.verification_fail_block_until * 1000));
+            await sendMessageToUser(chatId, `由于连续多次验证失败，您已被限制验证。${remainingFriendly}，解禁时间：${untilStr}`);
             return;
           }
-          await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
-          await handleVerification(chatId, messageId);
-          return;
+
+          if (!isVerified || (isRateLimited && !isFirstVerification)) {
+            if (isVerifying) {
+              const storedCode = await env.D1.prepare('SELECT verification_code, code_expiry FROM user_states WHERE chat_id = ?')
+                .bind(chatId)
+                .first();
+
+              const nowSeconds2 = Math.floor(Date.now() / 1000);
+              const isCodeExpired = !storedCode?.verification_code || !storedCode?.code_expiry || nowSeconds2 > storedCode.code_expiry;
+
+              if (isCodeExpired) {
+                await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
+                await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
+                  .bind(chatId)
+                  .run();
+                userStateCache.set(chatId, { ...userState, verification_code: null, code_expiry: null, is_verifying: false });
+
+                try {
+                  const lastVerification = await env.D1.prepare('SELECT last_verification_message_id FROM user_states WHERE chat_id = ?')
+                    .bind(chatId)
+                    .first();
+
+                  if (lastVerification?.last_verification_message_id) {
+                    try {
+                      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                          chat_id: chatId,
+                          message_id: lastVerification.last_verification_message_id
+                        })
+                      });
+                    } catch (deleteError) {
+                      logger('WARN', 'Failed to delete old verification message', deleteError.message);
+                    }
+
+                    await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
+                      .bind(chatId)
+                      .run();
+                  }
+                } catch (error) {
+                  logger('WARN', 'Failed to query last verification message', error.message);
+                }
+
+                try {
+                  await handleVerification(chatId, 0);
+                } catch (verificationError) {
+                  logger('ERROR', 'Failed to send new verification after expiry', verificationError.message);
+                  setTimeout(async () => {
+                    try { await handleVerification(chatId, 0); } catch (retryError) {
+                      logger('ERROR', 'Retry send verification failed', retryError.message);
+                      await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
+                    }
+                  }, 1000);
+                }
+                return;
+              } else {
+                await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
+              }
+              return;
+            }
+            await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
+            await handleVerification(chatId, messageId);
+            return;
+          }
         }
       }
 
       if (text === '/start') {
-        if (await checkStartCommandRate(chatId)) {
+        if (!isAdmin && await checkStartCommandRate(chatId)) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
           return;
         }
 
         const successMessage = await getVerificationSuccessMessage();
         await sendMessageToUser(chatId, `${successMessage}\n你可以用这个机器人跟我对话。写下您想要发送的消息（图片、视频），我会尽快回复您！`);
-        const userInfo = await getUserInfo(chatId);
-        await ensureUserTopic(chatId, userInfo);
+        if (!isAdmin) {
+          const userInfo = await getUserInfo(chatId);
+          await ensureUserTopic(chatId, userInfo);
+        }
         return;
       }
 
@@ -424,20 +563,23 @@ export default {
         return;
       }
 
-      let topicId = await ensureUserTopic(chatId, userInfo);
-      if (!topicId) {
-        await sendMessageToUser(chatId, "无法创建话题，请稍后再试或联系管理员。");
-        return;
-      }
-
-      const isTopicValid = await validateTopic(topicId);
-      if (!isTopicValid) {
-        await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
-        topicIdCache.set(chatId, undefined);
+      let topicId = null;
+      if (!isAdmin) {
         topicId = await ensureUserTopic(chatId, userInfo);
         if (!topicId) {
-          await sendMessageToUser(chatId, "无法重新创建话题，请稍后再试或联系管理员。");
+          await sendMessageToUser(chatId, "无法创建话题，请稍后再试或联系管理员。");
           return;
+        }
+
+        const isTopicValid = await validateTopic(topicId);
+        if (!isTopicValid) {
+          await env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(chatId).run();
+          topicIdCache.set(chatId, undefined);
+          topicId = await ensureUserTopic(chatId, userInfo);
+          if (!topicId) {
+            await sendMessageToUser(chatId, "无法重新创建话题，请稍后再试或联系管理员。");
+            return;
+          }
         }
       }
 
@@ -446,9 +588,17 @@ export default {
 
       if (text) {
         const formattedMessage = `${nickname}:\n${text}`;
-        await sendMessageToTopic(topicId, formattedMessage);
+        if (topicId) {
+          await sendMessageToTopic(topicId, formattedMessage);
+        } else {
+          await sendMessageToUser(chatId, "管理员消息已接收（私聊模式），如需转发请使用群组内功能。");
+        }
       } else {
-        await copyMessageToTopic(topicId, message);
+        if (topicId) {
+          await copyMessageToTopic(topicId, message);
+        } else {
+          await sendMessageToUser(chatId, "无法处理该消息类型（管理员私聊未创建话题）。");
+        }
       }
     }
 
@@ -500,9 +650,9 @@ export default {
         const newLock = (async () => {
           const userName = userInfo.username || `User_${chatId}`;
           const nickname = userInfo.nickname || userName;
-          topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
-          await saveTopicId(chatId, topicId);
-          return topicId;
+          const topicIdInner = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
+          await saveTopicId(chatId, topicIdInner, Date.now(), Date.now());
+          return topicIdInner;
         })();
 
         topicCreationLocks.set(chatId, newLock);
@@ -581,21 +731,58 @@ export default {
       ]);
     }
 
+    async function sendPrivateAdminPanel(chatId) {
+      const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
+        .bind(true)
+        .all();
+
+      const rows = blockedUsers.results || [];
+      const inline_keyboard = [];
+
+      if (rows.length === 0) {
+        inline_keyboard.push([{ text: '当前没有被拉黑的用户', callback_data: `noop` }]);
+      } else {
+        for (const row of rows) {
+          inline_keyboard.push([{ text: `解除 ${row.chat_id}`, callback_data: `private_unblock_${row.chat_id}` }]);
+        }
+      }
+
+      inline_keyboard.push([{ text: (await getSetting('verification_enabled', env.D1)) === 'true' ? '关闭验证码' : '开启验证码', callback_data: 'toggle_verification_private' }]);
+
+      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: '私聊管理员面板：',
+          reply_markup: { inline_keyboard }
+        })
+      });
+    }
+
     async function getVerificationSuccessMessage() {
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
       if (!userRawEnabled) return '验证成功。';
 
-      const response = await fetch('https://raw.githubusercontent.com/wuyangdaily/ctt/refs/heads/main/CFTeleTrans/start.md');
-      if (!response.ok) return '验证成功。';
-      const message = await response.text();
-      return message.trim() || '验证成功。';
+      try {
+        const response = await fetch('https://raw.githubusercontent.com/wuyangdaily/ctt/refs/heads/main/CFTeleTrans/start.md');
+        if (!response.ok) return '验证成功。';
+        const message = await response.text();
+        return message.trim() || '验证成功。';
+      } catch (e) {
+        return '验证成功。';
+      }
     }
 
     async function getNotificationContent() {
-      const response = await fetch('https://raw.githubusercontent.com/wuyangdaily/ctt/refs/heads/main/CFTeleTrans/notification.md');
-      if (!response.ok) return '';
-      const content = await response.text();
-      return content.trim() || '';
+      try {
+        const response = await fetch('https://raw.githubusercontent.com/wuyangdaily/ctt/refs/heads/main/CFTeleTrans/notification.md');
+        if (!response.ok) return '';
+        const content = await response.text();
+        return content.trim() || '';
+      } catch (e) {
+        return '';
+      }
     }
 
     async function checkStartCommandRate(chatId) {
@@ -690,6 +877,7 @@ export default {
       } else if (key === 'user_raw_enabled') {
         settingsCache.set('user_raw_enabled', value === 'true');
       }
+      logger('INFO', `Setting changed ${key} = ${value}`);
     }
 
     async function onCallbackQuery(callbackQuery) {
@@ -729,6 +917,13 @@ export default {
       } else if (data.startsWith('delete_user_')) {
         action = 'delete_user';
         privateChatId = parts.slice(2).join('_');
+      } else if (data.startsWith('private_unblock_')) {
+        action = 'private_unblock';
+        privateChatId = parts.slice(1).join('_');
+      } else if (data === 'toggle_verification_private') {
+        action = 'toggle_verification_private';
+      } else if (data === 'noop') {
+        action = 'noop';
       } else {
         action = data;
         privateChatId = '';
@@ -742,11 +937,11 @@ export default {
 
         let verificationState = userStateCache.get(chatId);
         if (verificationState === undefined) {
-          verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+          verificationState = await env.D1.prepare('SELECT verification_code, code_expiry, is_verifying, verification_fail_count, verification_fail_block_until FROM user_states WHERE chat_id = ?')
             .bind(chatId)
             .first();
           if (!verificationState) {
-            verificationState = { verification_code: null, code_expiry: null, is_verifying: false };
+            verificationState = { verification_code: null, code_expiry: null, is_verifying: false, verification_fail_count: 0, verification_fail_block_until: null };
           }
           userStateCache.set(chatId, verificationState);
         }
@@ -755,14 +950,29 @@ export default {
         const codeExpiry = verificationState.code_expiry;
         const nowSeconds = Math.floor(Date.now() / 1000);
 
+        if (verificationState.verification_fail_block_until && nowSeconds < verificationState.verification_fail_block_until) {
+          const remainingSec = verificationState.verification_fail_block_until - nowSeconds;
+          const remainingFriendly = formatRemainingTime(remainingSec);
+          const untilStr = formatShanghai(new Date(verificationState.verification_fail_block_until * 1000));
+          await sendMessageToUser(chatId, `由于连续多次验证失败，您已被限制验证。${remainingFriendly}，解禁时间：${untilStr}`);
+          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: messageId
+            })
+          }).catch(()=>{});
+          return;
+        }
+
         if (!storedCode || (codeExpiry && nowSeconds > codeExpiry)) {
           await sendMessageToUser(chatId, '验证码已过期，正在为您发送新的验证码...');
           await env.D1.prepare('UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?')
             .bind(chatId)
             .run();
           userStateCache.set(chatId, { ...verificationState, verification_code: null, code_expiry: null, is_verifying: false });
-          
-          // 删除旧的验证消息
+
           try {
             await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
               method: 'POST',
@@ -773,21 +983,18 @@ export default {
               })
             });
           } catch (error) {
-            console.log(`删除过期验证按钮失败: ${error.message}`);
-            // 即使删除失败也继续处理
+            logger('WARN', 'Failed to delete expired verification button', error.message);
           }
-          
-          // 立即发送新的验证码
+
           try {
             await handleVerification(chatId, 0);
           } catch (verificationError) {
-            console.error(`发送新验证码失败: ${verificationError.message}`);
-            // 如果发送验证码失败，则再次尝试
+            logger('ERROR', 'Failed to send new verification', verificationError.message);
             setTimeout(async () => {
               try {
                 await handleVerification(chatId, 0);
               } catch (retryError) {
-                console.error(`重试发送验证码仍失败: ${retryError.message}`);
+                logger('ERROR', 'Retry sending verification failed', retryError.message);
                 await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
               }
             }, 1000);
@@ -797,13 +1004,13 @@ export default {
 
         if (result === 'correct') {
           const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
-            .bind(true, verifiedExpiry, false, false, chatId)
+          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ?, verification_fail_count = ?, verification_fail_block_until = NULL WHERE chat_id = ?')
+            .bind(true, verifiedExpiry, false, false, 0, chatId)
             .run();
-          verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_first_verification, is_verifying FROM user_states WHERE chat_id = ?')
+          const verificationStateNew = await env.D1.prepare('SELECT is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_first_verification, is_verifying, verification_fail_count, verification_fail_block_until FROM user_states WHERE chat_id = ?')
             .bind(chatId)
             .first();
-          userStateCache.set(chatId, verificationState);
+          userStateCache.set(chatId, verificationStateNew);
 
           let rateData = await env.D1.prepare('SELECT message_count, window_start FROM message_rates WHERE chat_id = ?')
             .bind(chatId)
@@ -820,8 +1027,38 @@ export default {
           const userInfo = await getUserInfo(chatId);
           await ensureUserTopic(chatId, userInfo);
         } else {
-          await sendMessageToUser(chatId, '验证失败，请重新尝试。');
-          await handleVerification(chatId, messageId);
+          // 验证失败处理：计数，达到 5 次则短时封禁 1 小时
+          let failCount = verificationState.verification_fail_count || 0;
+          failCount += 1;
+          const nowSeconds2 = Math.floor(Date.now() / 1000);
+          if (failCount >= 5) {
+            const blockUntil = nowSeconds2 + 3600; // 1 hour
+            await env.D1.prepare('UPDATE user_states SET verification_fail_count = ?, verification_fail_block_until = ? WHERE chat_id = ?')
+              .bind(failCount, blockUntil, chatId)
+              .run();
+            userStateCache.set(chatId, { ...verificationState, verification_fail_count: failCount, verification_fail_block_until: blockUntil });
+            const remainingSec = blockUntil - nowSeconds2;
+            const remainingFriendly = formatRemainingTime(remainingSec);
+            const untilStr = formatShanghai(new Date(blockUntil * 1000));
+            await sendMessageToUser(chatId, `验证失败次数已达到 ${failCount} 次，您被限制再次验证。${remainingFriendly}，解禁时间：${untilStr}`);
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: chatId,
+                message_id: messageId
+              })
+            }).catch(()=>{});
+            logger('INFO', `User ${chatId} locked for failed verifications until ${blockUntil}`);
+            return;
+          } else {
+            await env.D1.prepare('UPDATE user_states SET verification_fail_count = ? WHERE chat_id = ?')
+              .bind(failCount, chatId)
+              .run();
+            userStateCache.set(chatId, { ...verificationState, verification_fail_count: failCount });
+            await sendMessageToUser(chatId, '验证失败，请重新尝试。');
+            await handleVerification(chatId, messageId);
+          }
         }
 
         await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
@@ -833,6 +1070,7 @@ export default {
           })
         });
       } else {
+        // 非 verify 回调：管理员操作
         const senderId = callbackQuery.from.id.toString();
         const isAdmin = await checkIfAdmin(senderId);
         if (!isAdmin) {
@@ -854,7 +1092,7 @@ export default {
             .bind(privateChatId, true)
             .run();
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 已被拉黑，消息将不再转发。`);
-        } else if (action === 'unblock') {
+        } else if (action === 'unblock' || action === 'private_unblock') {
           let state = userStateCache.get(privateChatId);
           if (state === undefined) {
             state = await env.D1.prepare('SELECT is_blocked, is_first_verification FROM user_states WHERE chat_id = ?')
@@ -863,21 +1101,45 @@ export default {
           }
           state.is_blocked = false;
           state.is_first_verification = true;
-          userStateCache.set(privateChatId, state);
-          await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification) VALUES (?, ?, ?)')
-            .bind(privateChatId, false, true)
+          await env.D1.prepare('INSERT OR REPLACE INTO user_states (chat_id, is_blocked, is_first_verification, verification_fail_count, verification_fail_block_until) VALUES (?, ?, ?, ?, ?)')
+            .bind(privateChatId, false, true, 0, null)
             .run();
-          await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
+          userStateCache.set(privateChatId, { ...state, verification_fail_count: 0, verification_fail_block_until: null });
+          if (action === 'private_unblock') {
+            await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: senderId,
+                text: `用户 ${privateChatId} 已解除拉黑。`
+              })
+            });
+          } else {
+            await sendMessageToTopic(topicId, `用户 ${privateChatId} 已解除拉黑，消息将继续转发。`);
+            await sendAdminPanel(chatId, topicId, privateChatId, messageId);
+          }
         } else if (action === 'toggle_verification') {
           const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
           const newState = !currentState;
           await setSetting('verification_enabled', newState.toString());
           await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
+        } else if (action === 'toggle_verification_private') {
+          const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
+          const newState = !currentState;
+          await setSetting('verification_enabled', newState.toString());
+          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: senderId,
+              text: `验证码功能已${newState ? '开启' : '关闭'}。`
+            })
+          });
         } else if (action === 'check_blocklist') {
           const blockedUsers = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ?')
             .bind(true)
             .all();
-          const blockList = blockedUsers.results.length > 0 
+          const blockList = blockedUsers.results.length > 0
             ? blockedUsers.results.map(row => row.chat_id).join('\n')
             : '当前没有被拉黑的用户。';
           await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
@@ -887,14 +1149,10 @@ export default {
           await setSetting('user_raw_enabled', newState.toString());
           await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
         } else if (action === 'delete_user') {
-          // ------------------ 修改开始 ------------------
-          // goal: 删除用户时同时删除对应的话题（如果存在）
           try {
-            // 先查找该 privateChatId 对应的 topicId（从 cache 或 DB）
             const userTopicId = await getExistingTopicId(privateChatId);
             if (userTopicId) {
               try {
-                // deleteForumTopic 需要 bot 有管理话题/删除的权限
                 const delResp = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteForumTopic`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
@@ -905,23 +1163,20 @@ export default {
                 });
                 const delData = await delResp.json().catch(() => ({ ok: false, description: 'invalid json' }));
                 if (!delData.ok) {
-                  console.log(`删除话题 ${userTopicId} 失败: ${delData.description || JSON.stringify(delData)}`);
+                  logger('WARN', `Failed to delete topic ${userTopicId}`, delData.description || JSON.stringify(delData));
                 } else {
-                  console.log(`话题 ${userTopicId} 删除成功`);
+                  logger('INFO', `Deleted topic ${userTopicId} for user ${privateChatId}`);
                 }
               } catch (err) {
-                console.log(`调用 deleteForumTopic 出错: ${err.message}`);
-                // 不要因为 API 调用失败就放弃后续的 DB 清理
+                logger('WARN', `deleteForumTopic error for ${userTopicId}`, err.message);
               }
             } else {
-              console.log(`未找到用户 ${privateChatId} 的话题映射，跳过删除话题步骤`);
+              logger('INFO', `No topic mapping found for ${privateChatId}`);
             }
           } catch (err) {
-            console.log(`查找 topicId 出错: ${err.message}`);
-            // 继续执行删除 user 数据
+            logger('WARN', 'Error finding topicId to delete', err.message);
           }
 
-          // 清理缓存并从数据库删除用户相关记录
           userStateCache.set(privateChatId, undefined);
           messageRateCache.set(privateChatId, undefined);
           topicIdCache.set(privateChatId, undefined);
@@ -932,9 +1187,7 @@ export default {
             env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
           ]);
 
-          // 向管理员面板所在的 topic 发送反馈（注意这里使用的是管理员面板的 topicId 变量）
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
-          // ------------------ 修改结束 ------------------
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
         }
@@ -955,13 +1208,22 @@ export default {
       try {
         let userState = userStateCache.get(chatId);
         if (userState === undefined) {
-          userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
+          userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying, verification_fail_block_until FROM user_states WHERE chat_id = ?')
             .bind(chatId)
             .first();
           if (!userState) {
-            userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false };
+            userState = { is_blocked: false, is_first_verification: true, is_verified: false, verified_expiry: null, is_verifying: false, verification_fail_block_until: null };
           }
           userStateCache.set(chatId, userState);
+        }
+
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        if (userState.verification_fail_block_until && nowSeconds < userState.verification_fail_block_until) {
+          const remainingSec = userState.verification_fail_block_until - nowSeconds;
+          const remainingFriendly = formatRemainingTime(remainingSec);
+          const untilStr = formatShanghai(new Date(userState.verification_fail_block_until * 1000));
+          await sendMessageToUser(chatId, `由于连续多次验证失败，您已被限制验证。${remainingFriendly}，解禁时间：${untilStr}`);
+          return;
         }
 
         userState.verification_code = null;
@@ -987,10 +1249,9 @@ export default {
               })
             });
           } catch (deleteError) {
-            console.log(`删除上一条验证消息失败: ${deleteError.message}`);
-            // 继续处理，即使删除失败
+            logger('WARN', 'Failed to delete previous verification message', deleteError.message);
           }
-          
+
           userState.last_verification_message_id = null;
           userStateCache.set(chatId, userState);
           await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
@@ -998,11 +1259,9 @@ export default {
             .run();
         }
 
-        // 确保发送验证码
         await sendVerification(chatId);
       } catch (error) {
-        console.error(`处理验证过程失败: ${error.message}`);
-        // 重置用户状态以防卡住
+        logger('ERROR', 'handleVerification failed', error.message);
         try {
           await env.D1.prepare('UPDATE user_states SET is_verifying = FALSE WHERE chat_id = ?')
             .bind(chatId)
@@ -1013,14 +1272,24 @@ export default {
             userStateCache.set(chatId, currentState);
           }
         } catch (resetError) {
-          console.error(`重置用户验证状态失败: ${resetError.message}`);
+          logger('ERROR', 'Failed to reset user verifying flag', resetError.message);
         }
-        throw error; // 向上传递错误以便调用方处理
+        throw error;
       }
     }
 
     async function sendVerification(chatId) {
       try {
+        const st = await env.D1.prepare('SELECT verification_fail_block_until FROM user_states WHERE chat_id = ?').bind(chatId).first();
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (st?.verification_fail_block_until && nowSec < st.verification_fail_block_until) {
+          const remainingSec = st.verification_fail_block_until - nowSec;
+          const remainingFriendly = formatRemainingTime(remainingSec);
+          const untilStr = formatShanghai(new Date(st.verification_fail_block_until * 1000));
+          await sendMessageToUser(chatId, `由于连续多次验证失败，您已被限制验证。${remainingFriendly}，解禁时间：${untilStr}`);
+          return;
+        }
+
         const num1 = Math.floor(Math.random() * 10);
         const num2 = Math.floor(Math.random() * 10);
         const operation = Math.random() > 0.5 ? '+' : '-';
@@ -1069,26 +1338,32 @@ export default {
           await env.D1.prepare('UPDATE user_states SET verification_code = ?, code_expiry = ?, last_verification_message_id = ?, is_verifying = ? WHERE chat_id = ?')
             .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
             .run();
+          logger('INFO', `Sent verification to ${chatId}`);
         } else {
           throw new Error(`Telegram API 返回错误: ${data.description || '未知错误'}`);
         }
       } catch (error) {
-        console.error(`发送验证码失败: ${error.message}`);
-        throw error; // 向上传递错误以便调用方处理
+        logger('ERROR', 'sendVerification failed', error.message);
+        throw error;
       }
     }
 
     async function checkIfAdmin(userId) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: GROUP_ID,
-          user_id: userId
-        })
-      });
-      const data = await response.json();
-      return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            user_id: userId
+          })
+        });
+        const data = await response.json();
+        return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
+      } catch (err) {
+        logger('WARN', 'checkIfAdmin request failed', err.message);
+        return false;
+      }
     }
 
     async function getUserInfo(chatId) {
@@ -1151,53 +1426,28 @@ export default {
       if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
       const topicId = data.result.message_thread_id;
 
-      // 将时间格式化为北京时间（Asia/Shanghai）
-function formatBeijing(date = new Date()) {
-  const df = new Intl.DateTimeFormat('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  });
-
-  const parts = df.formatToParts(date);
-  const map = {};
-  parts.forEach(p => { if (p.type !== 'literal') map[p.type] = p.value; });
-
-  // 返回 "YYYY-MM-DD HH:mm:ss"
-  return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
-}
-
-// ----- 你的原代码片段（只替换时间部分） -----
-(async () => {
-  try {
-    // 取得北京时间字符串
-    const formattedTime = formatBeijing();
-
-    const notificationContent = await getNotificationContent();
-    const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
-    const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
-    const messageId = messageResponse.result.message_id;
-    await pinMessage(topicId, messageId);
-  } catch (err) {
-    console.error('发送/置顶消息出错：', err);
-    throw err;
-  }
-})();
-
+      try {
+        const formattedTime = formatShanghai();
+        const notificationContent = await getNotificationContent();
+        const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
+        const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
+        const messageId = messageResponse.result.message_id;
+        await pinMessage(topicId, messageId);
+      } catch (err) {
+        logger('WARN', 'Failed to send/pin pinned message for new topic', err.message);
+      }
 
       return topicId;
     }
 
-    async function saveTopicId(chatId, topicId) {
-      await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id) VALUES (?, ?)')
-        .bind(chatId, topicId)
+    async function saveTopicId(chatId, topicId, createdAt = null, lastInteraction = null) {
+      if (createdAt === null) createdAt = Date.now();
+      if (lastInteraction === null) lastInteraction = createdAt;
+      await env.D1.prepare('INSERT OR REPLACE INTO chat_topic_mappings (chat_id, topic_id, created_at, last_interaction) VALUES (?, ?, ?, ?)')
+        .bind(chatId, topicId, createdAt, lastInteraction)
         .run();
       topicIdCache.set(chatId, topicId);
+      logger('INFO', `Saved topic mapping ${chatId} -> ${topicId}`);
     }
 
     async function getPrivateChatId(topicId) {
@@ -1209,7 +1459,7 @@ function formatBeijing(date = new Date()) {
     }
 
     async function sendMessageToTopic(topicId, text) {
-      if (!text.trim()) {
+      if (!text || !text.trim()) {
         throw new Error('Message text is empty');
       }
 
@@ -1227,6 +1477,18 @@ function formatBeijing(date = new Date()) {
       if (!data.ok) {
         throw new Error(`Failed to send message to topic ${topicId}: ${data.description}`);
       }
+
+      try {
+        const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?').bind(topicId).first();
+        if (mapping?.chat_id) {
+          const now = Date.now();
+          await env.D1.prepare('UPDATE chat_topic_mappings SET last_interaction = ? WHERE chat_id = ?').bind(now, mapping.chat_id).run();
+          topicIdCache.set(mapping.chat_id, topicId);
+        }
+      } catch (e) {
+        logger('WARN', 'Failed to update last_interaction for topic', e.message);
+      }
+
       return data;
     }
 
@@ -1246,6 +1508,16 @@ function formatBeijing(date = new Date()) {
       const data = await response.json();
       if (!data.ok) {
         throw new Error(`Failed to copy message to topic ${topicId}: ${data.description}`);
+      }
+
+      try {
+        const mapping = await env.D1.prepare('SELECT chat_id FROM chat_topic_mappings WHERE topic_id = ?').bind(topicId).first();
+        if (mapping?.chat_id) {
+          const now = Date.now();
+          await env.D1.prepare('UPDATE chat_topic_mappings SET last_interaction = ? WHERE chat_id = ?').bind(now, mapping.chat_id).run();
+        }
+      } catch (e) {
+        logger('WARN', 'Failed to update last_interaction after copyMessage', e.message);
       }
     }
 
@@ -1281,6 +1553,13 @@ function formatBeijing(date = new Date()) {
       const data = await response.json();
       if (!data.ok) {
         throw new Error(`Failed to forward message to private chat: ${data.description}`);
+      }
+
+      try {
+        const now = Date.now();
+        await env.D1.prepare('UPDATE chat_topic_mappings SET last_interaction = ? WHERE chat_id = ?').bind(now, privateChatId).run();
+      } catch (e) {
+        logger('WARN', 'Failed to update last_interaction when forwarding message to private chat', e.message);
       }
     }
 
@@ -1345,6 +1624,7 @@ function formatBeijing(date = new Date()) {
     try {
       return await handleRequest(request);
     } catch (error) {
+      logger('ERROR', 'Unhandled error in fetch', error.message);
       return new Response('Internal Server Error', { status: 500 });
     }
   }
