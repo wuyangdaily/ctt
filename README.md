@@ -71,7 +71,7 @@
 - `BOT_TOKEN_ENV`：您的Telegram Bot Token（例如`123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`）。
 - `GROUP_ID_ENV`：后台群组的Chat ID（例如`-100123456789`）。
 - `MAX_MESSAGES_PER_MINUTE_ENV`：消息频率限制（例如`40`）。
-
+- `ADMIN_USER_IDS`：管理员ID（例如`123456 多个用,隔开`）。
 #### 步骤 4：绑定D1 SQL数据库
 1. 在创建的Workers项目 **设置 > 绑定** 中，绑定数据库：
 - 添加-选择D1数据库
