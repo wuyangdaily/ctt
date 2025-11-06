@@ -72,6 +72,7 @@
 - `GROUP_ID_ENV`：后台群组的Chat ID（例如`-100123456789`）。
 - `MAX_MESSAGES_PER_MINUTE_ENV`：消息频率限制（例如`40`）。
 - `ADMIN_USER_IDS`：管理员ID（例如`123456 多个用,隔开`）。
+- `GENERAL_TOPIC_ID`：话题ID（例如`1641 @nmnmfunbot电报机器人/id命令获取"message_thread_id":的值`）。
 #### 步骤 4：绑定D1 SQL数据库
 1. 在创建的Workers项目 **设置 > 绑定** 中，绑定数据库：
 - 添加-选择D1数据库
