@@ -11,7 +11,8 @@ const processedCallbacks = new Set();
 const topicCreationLocks = new Map();
 
 const settingsCache = new Map([
-  ['verification_enabled', null]
+  ['verification_enabled', null],
+  ['user_raw_enabled', null]
 ]);
 
 class LRUCache {
@@ -43,6 +44,21 @@ const userInfoCache = new LRUCache(1000);
 const topicIdCache = new LRUCache(1000);
 const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
+
+// 将UTC时间转换为北京时间（UTC+8）
+function formatBeijingTime(utcDate) {
+  // 创建北京时间的Date对象（UTC+8）
+  const beijingTime = new Date(utcDate.getTime() + 8 * 60 * 60 * 1000);
+  
+  const year = beijingTime.getUTCFullYear();
+  const month = String(beijingTime.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(beijingTime.getUTCDate()).padStart(2, '0');
+  const hours = String(beijingTime.getUTCHours()).padStart(2, '0');
+  const minutes = String(beijingTime.getUTCMinutes()).padStart(2, '0');
+  const seconds = String(beijingTime.getUTCSeconds()).padStart(2, '0');
+  
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
 
 export default {
   async fetch(request, env) {
@@ -214,10 +230,13 @@ export default {
 
       await Promise.all([
         d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-          .bind('verification_enabled', 'true').run()
+          .bind('verification_enabled', 'true').run(),
+        d1.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
+          .bind('user_raw_enabled', 'true').run()
       ]);
 
       settingsCache.set('verification_enabled', (await getSetting('verification_enabled', d1)) === 'true');
+      settingsCache.set('user_raw_enabled', (await getSetting('user_raw_enabled', d1)) === 'true');
     }
 
     async function createTable(d1, tableName, structure) {
@@ -538,6 +557,7 @@ export default {
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
 
       const buttons = [
         [
@@ -577,7 +597,13 @@ export default {
     }
 
     async function getVerificationSuccessMessage() {
-      return '验证成功。';
+      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+      if (!userRawEnabled) return '验证成功。';
+
+      const response = await fetch('https://raw.githubusercontent.com/wuyangdaily/ctt/refs/heads/main/CFTeleTrans/start.md');
+      if (!response.ok) return '验证成功。';
+      const message = await response.text();
+      return message.trim() || '验证成功。';
     }
 
     async function getNotificationContent() {
@@ -676,6 +702,8 @@ export default {
             .run();
           userStateCache.clear();
         }
+      } else if (key === 'user_raw_enabled') {
+        settingsCache.set('user_raw_enabled', value === 'true');
       }
     }
 
@@ -701,6 +729,9 @@ export default {
       } else if (data.startsWith('toggle_verification_')) {
         action = 'toggle_verification';
         privateChatId = parts.slice(2).join('_');
+      } else if (data.startsWith('toggle_user_raw_')) {
+        action = 'toggle_user_raw';
+        privateChatId = parts.slice(3).join('_');
       } else if (data.startsWith('check_blocklist_')) {
         action = 'check_blocklist';
         privateChatId = parts.slice(2).join('_');
@@ -865,6 +896,11 @@ export default {
             ? blockedUsers.results.map(row => row.chat_id).join('\n')
             : '当前没有被拉黑的用户。';
           await sendMessageToTopic(topicId, `黑名单列表：\n${blockList}`);
+        } else if (action === 'toggle_user_raw') {
+          const currentState = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+          const newState = !currentState;
+          await setSetting('user_raw_enabled', newState.toString());
+          await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
         } else if (action === 'delete_user') {
           userStateCache.set(privateChatId, undefined);
           messageRateCache.set(privateChatId, undefined);
@@ -1092,10 +1128,8 @@ export default {
       const topicId = data.result.message_thread_id;
 
       const now = new Date();
-      const formattedTime = new Date().toLocaleString('zh-CN', {
-        hour12: false,
-        timeZone: 'Asia/Shanghai'
-      }).replace(/\//g, '-');      
+      // 使用formatBeijingTime函数将UTC时间转换为北京时间
+      const formattedTime = formatBeijingTime(now);
       const notificationContent = await getNotificationContent();
       const pinnedMessage = `昵称: ${nickname}\n用户名: @${userName}\nUserID: ${userId}\n发起时间: ${formattedTime}\n\n${notificationContent}`;
       const messageResponse = await sendMessageToTopic(topicId, pinnedMessage);
@@ -1258,6 +1292,5 @@ export default {
       return await handleRequest(request);
     } catch (error) {
       return new Response('Internal Server Error', { status: 500 });
-    }
-  }
+    }  }
 };
