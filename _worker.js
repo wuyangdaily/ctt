@@ -299,7 +299,7 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
-      // 处理 /admin 命令 - 修复这里的问题
+      // 处理 /admin 命令
       if (chatId === GROUP_ID && text.trim() === '/admin') {
         const topicId = message.message_thread_id;
         console.log(`收到 /admin 命令，chatId: ${chatId}, topicId: ${topicId}, GENERAL_TOPIC_ID: ${GENERAL_TOPIC_ID}`);
@@ -334,9 +334,9 @@ export default {
       if (isAdmin) {
         console.log(`管理员 ${message.from.id} 私聊机器人，跳过验证和话题创建`);
         if (text === '/start') {
-          await sendMessageToUser(chatId, "尊敬的管理员，您好！您可以直接与机器人对话，无需验证且不会创建话题。");
+          await sendMessageToUser(chatId, "尊敬的管理员，您好！您无需验证可以直接与机器人对话。");
         } else {
-          await sendMessageToUser(chatId, "尊敬的管理员，您的消息已收到。作为管理员，您无需验证且不会创建话题。");
+          await sendMessageToUser(chatId, "尊敬的管理员，您好！您无需验证可以直接与机器人对话。");
         }
         return;
       }
@@ -496,12 +496,12 @@ export default {
     async function handleAdminCommand(message) {
       const chatId = message.chat.id.toString();
       const topicId = message.message_thread_id;
-      const senderId = message.from.id.toString();
+      const senderId = message.from.id; // 使用数字ID而不是字符串
       const messageId = message.message_id;
       
-      console.log(`处理管理员命令，senderId: ${senderId}`);
+      console.log(`处理管理员命令，senderId: ${senderId}, chatId: ${chatId}, topicId: ${topicId}`);
       
-      // 检查是否是管理员
+      // 检查是否是管理员 - 修复：使用正确的用户ID
       const isAdmin = await checkIfAdmin(senderId);
       if (!isAdmin) {
         console.log(`用户 ${senderId} 不是管理员`);
@@ -511,120 +511,133 @@ export default {
 
       console.log(`用户 ${senderId} 是管理员，发送全局管理员面板`);
       
-      // 先删除 /admin 命令消息
       try {
-        await deleteMessage(chatId, messageId);
-        console.log(`已删除 /admin 命令消息: ${messageId}`);
+        // 先发送管理员面板，再删除命令消息，避免竞争条件
+        const success = await sendGlobalAdminPanel(chatId, topicId, 0);
+        
+        if (success) {
+          // 面板发送成功后删除命令消息
+          await deleteMessage(chatId, messageId);
+          console.log(`已删除 /admin 命令消息: ${messageId}`);
+        } else {
+          console.log('发送管理员面板失败，不删除命令消息');
+        }
       } catch (error) {
-        console.log(`删除 /admin 命令消息失败: ${error.message}`);
-        // 继续处理，即使删除失败
+        console.error(`处理管理员命令失败: ${error.message}`);
+        // 即使删除失败，面板已经发送，所以继续处理
       }
-      
-      // 发送全局管理员面板
-      await sendGlobalAdminPanel(chatId, topicId, 0); // 从第0页开始
     }
 
     async function sendGlobalAdminPanel(chatId, topicId, page = 0) {
       console.log(`发送全局管理员面板，chatId: ${chatId}, topicId: ${topicId}, page: ${page}`);
       
-      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      
-      // 获取封禁用户列表（分页）
-      const blockedUsers = await getBlockedUsers(page, 10);
-      const totalBlocked = await getTotalBlockedUsers();
-      const totalPages = Math.ceil(totalBlocked / 10);
+      try {
+        const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+        
+        // 获取封禁用户列表（分页）
+        const blockedUsers = await getBlockedUsers(page, 10);
+        const totalBlocked = await getTotalBlockedUsers();
+        const totalPages = Math.ceil(totalBlocked / 10) || 1;
 
-      let text = `🔧 *全局管理员面板*\n\n`;
-      text += `✅ *验证码状态*: ${verificationEnabled ? '开启' : '关闭'}\n`;
-      text += `🚫 *封禁用户数*: ${totalBlocked}\n\n`;
+        let text = `🔧 *全局管理员面板*\n\n`;
+        text += `✅ *验证码状态*: ${verificationEnabled ? '开启' : '关闭'}\n`;
+        text += `🚫 *封禁用户数*: ${totalBlocked}\n\n`;
 
-      if (blockedUsers.length === 0) {
-        text += `📝 当前没有被封禁的用户。`;
-      } else {
-        text += `*被封禁用户列表 (${page + 1}/${totalPages || 1})*:\n`;
-        blockedUsers.forEach((user, index) => {
-          text += `${index + 1 + page * 10}. 用户ID: \`${user.chat_id}\`\n`;
-        });
-      }
-
-      const buttons = [];
-
-      // 为每个封禁用户添加解封按钮
-      blockedUsers.forEach(user => {
-        buttons.push([{
-          text: `🔓 解封 ${user.chat_id}`,
-          callback_data: `global_unblock_${user.chat_id}_${page}`
-        }]);
-      });
-
-      // 翻页按钮
-      if (totalBlocked > 10) {
-        const navButtons = [];
-        if (page > 0) {
-          navButtons.push({
-            text: '⬅️ 上一页',
-            callback_data: `global_admin_${page - 1}`
+        if (blockedUsers.length === 0) {
+          text += `📝 当前没有被封禁的用户。`;
+        } else {
+          text += `*被封禁用户列表 (${page + 1}/${totalPages})*:\n`;
+          blockedUsers.forEach((user, index) => {
+            text += `${index + 1 + page * 10}. 用户ID: \`${user.chat_id}\`\n`;
           });
         }
-        if (page < totalPages - 1) {
-          navButtons.push({
-            text: '下一页 ➡️',
-            callback_data: `global_admin_${page + 1}`
-          });
-        }
-        if (navButtons.length > 0) {
-          buttons.push(navButtons);
-        }
-      }
 
-      // 验证码开关按钮
-      buttons.push([
-        { 
-          text: verificationEnabled ? '🔴 关闭验证码' : '🟢 开启验证码', 
-          callback_data: `global_toggle_verification_${page}` 
-        }
-      ]);
+        const buttons = [];
 
-      const replyMarkup = { inline_keyboard: buttons };
-
-      // 发送或更新消息
-      const panelMessageId = adminPanelMessages.get(`${chatId}:${topicId}`);
-      
-      if (panelMessageId) {
-        // 编辑现有消息
-        console.log(`编辑现有管理员面板消息: ${panelMessageId}`);
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: panelMessageId,
-            text: text,
-            parse_mode: 'Markdown',
-            reply_markup: replyMarkup
-          })
+        // 为每个封禁用户添加解封按钮
+        blockedUsers.forEach(user => {
+          buttons.push([{
+            text: `🔓 解封 ${user.chat_id}`,
+            callback_data: `global_unblock_${user.chat_id}_${page}`
+          }]);
         });
-      } else {
-        // 发送新消息
+
+        // 翻页按钮
+        if (totalPages > 1) {
+          const navButtons = [];
+          if (page > 0) {
+            navButtons.push({
+              text: '⬅️ 上一页',
+              callback_data: `global_admin_${page - 1}`
+            });
+          }
+          if (page < totalPages - 1) {
+            navButtons.push({
+              text: '下一页 ➡️',
+              callback_data: `global_admin_${page + 1}`
+            });
+          }
+          if (navButtons.length > 0) {
+            buttons.push(navButtons);
+          }
+        }
+
+        // 验证码开关按钮
+        buttons.push([
+          { 
+            text: verificationEnabled ? '🔴 关闭验证码' : '🟢 开启验证码', 
+            callback_data: `global_toggle_verification_${page}` 
+          }
+        ]);
+
+        const replyMarkup = { inline_keyboard: buttons };
+
+        // 发送新消息（不尝试编辑，避免复杂的状态管理）
         console.log('发送新的管理员面板消息');
+        const messageBody = {
+          chat_id: chatId,
+          text: text,
+          parse_mode: 'Markdown',
+          reply_markup: replyMarkup
+        };
+        
+        // 如果有话题ID，添加到消息体中
+        if (topicId) {
+          messageBody.message_thread_id = topicId;
+        }
+        
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_thread_id: topicId,
-            text: text,
-            parse_mode: 'Markdown',
-            reply_markup: replyMarkup
-          })
+          body: JSON.stringify(messageBody)
         });
+        
         const data = await response.json();
         if (data.ok) {
-          console.log(`管理员面板消息ID: ${data.result.message_id}`);
-          adminPanelMessages.set(`${chatId}:${topicId}`, data.result.message_id);
+          console.log(`管理员面板消息发送成功，消息ID: ${data.result.message_id}`);
+          // 存储面板消息ID以便后续更新
+          const panelKey = `${chatId}:${topicId || 'default'}`;
+          adminPanelMessages.set(panelKey, data.result.message_id);
+          return true;
         } else {
           console.error(`发送管理员面板失败: ${JSON.stringify(data)}`);
+          // 如果失败，尝试发送简单的错误消息
+          try {
+            await sendMessageToTopic(topicId, '发送管理员面板失败，请稍后重试。');
+          } catch (e) {
+            console.error(`发送错误消息也失败: ${e.message}`);
+          }
+          return false;
         }
+      } catch (error) {
+        console.error(`发送全局管理员面板时出错: ${error.message}`);
+        // 发送错误消息
+        try {
+          await sendMessageToTopic(topicId, '发送管理员面板时出现错误，请稍后重试。');
+        } catch (e) {
+          console.error(`发送错误消息也失败: ${e.message}`);
+        }
+        return false;
       }
     }
 
@@ -1066,6 +1079,9 @@ export default {
           callback_query_id: callbackQuery.id
         })
       });
+
+      // 清理过期的面板消息引用
+      cleanupAdminPanelMessages();
     }
 
     async function handleGlobalAdminCallback(callbackQuery) {
@@ -1110,7 +1126,7 @@ export default {
         if (totalBlocked === 0) {
           // 如果没有封禁用户了，删除面板消息
           await deleteMessage(chatId, messageId);
-          adminPanelMessages.delete(`${chatId}:${topicId}`);
+          adminPanelMessages.delete(`${chatId}:${topicId || 'default'}`);
           await sendMessageToTopic(topicId, '✅ 所有用户已解封，管理员面板已关闭。');
         } else {
           // 刷新面板
@@ -1138,6 +1154,17 @@ export default {
           callback_query_id: callbackQuery.id
         })
       });
+
+      // 清理过期的面板消息引用
+      cleanupAdminPanelMessages();
+    }
+
+    function cleanupAdminPanelMessages() {
+      // 简单实现：定期清理，避免内存泄漏
+      if (adminPanelMessages.size > 1000) {
+        console.log('清理管理员面板消息缓存，当前大小:', adminPanelMessages.size);
+        adminPanelMessages.clear();
+      }
     }
 
     async function deleteMessage(chatId, messageId) {
