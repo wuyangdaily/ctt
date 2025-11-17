@@ -1,6 +1,7 @@
 let BOT_TOKEN;
 let GROUP_ID;
 let MAX_MESSAGES_PER_MINUTE;
+let GENERAL_TOPIC_ID;
 
 let lastCleanupTime = 0;
 const CLEANUP_INTERVAL = 24 * 60 * 60 * 1000; // 24 小时
@@ -9,6 +10,7 @@ const processedMessages = new Set();
 const processedCallbacks = new Set();
 
 const topicCreationLocks = new Map();
+const adminPanelMessages = new Map(); // 存储面板消息ID
 
 const settingsCache = new Map([
   ['verification_enabled', null],
@@ -65,6 +67,7 @@ export default {
     BOT_TOKEN = env.BOT_TOKEN_ENV || null;
     GROUP_ID = env.GROUP_ID_ENV || null;
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
+    GENERAL_TOPIC_ID = env.GENERAL_TOPIC_ID ? parseInt(env.GENERAL_TOPIC_ID) : 1; // 默认值为1
 
     if (!env.D1) {
       return new Response('Server configuration error: D1 database is not bound', { status: 500 });
@@ -296,14 +299,25 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
+      // 处理 /admin 命令 - 修复这里的问题
+      if (chatId === GROUP_ID && text.trim() === '/admin') {
+        const topicId = message.message_thread_id;
+        console.log(`收到 /admin 命令，chatId: ${chatId}, topicId: ${topicId}, GENERAL_TOPIC_ID: ${GENERAL_TOPIC_ID}`);
+        
+        // 检查是否在默认话题中（包括没有message_thread_id的情况，这表示默认话题）
+        if (!topicId || topicId === GENERAL_TOPIC_ID) {
+          console.log('在默认话题中，处理 /admin 命令');
+          await handleAdminCommand(message);
+          return;
+        } else {
+          console.log('不在默认话题中，忽略 /admin 命令');
+        }
+      }
+
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
-          if (privateChatId && text === '/admin') {
-            await sendAdminPanel(chatId, topicId, privateChatId, messageId);
-            return;
-          }
           if (privateChatId && text.startsWith('/reset_user')) {
             await handleResetUser(chatId, topicId, text);
             return;
@@ -467,6 +481,156 @@ export default {
       }
     }
 
+    async function handleAdminCommand(message) {
+      const chatId = message.chat.id.toString();
+      const topicId = message.message_thread_id;
+      const senderId = message.from.id.toString();
+      const messageId = message.message_id;
+      
+      console.log(`处理管理员命令，senderId: ${senderId}`);
+      
+      // 检查是否是管理员
+      const isAdmin = await checkIfAdmin(senderId);
+      if (!isAdmin) {
+        console.log(`用户 ${senderId} 不是管理员`);
+        await sendMessageToTopic(topicId, '只有管理员可以使用此命令。');
+        return;
+      }
+
+      console.log(`用户 ${senderId} 是管理员，发送全局管理员面板`);
+      
+      // 先删除 /admin 命令消息
+      try {
+        await deleteMessage(chatId, messageId);
+        console.log(`已删除 /admin 命令消息: ${messageId}`);
+      } catch (error) {
+        console.log(`删除 /admin 命令消息失败: ${error.message}`);
+        // 继续处理，即使删除失败
+      }
+      
+      // 发送全局管理员面板
+      await sendGlobalAdminPanel(chatId, topicId, 0); // 从第0页开始
+    }
+
+    async function sendGlobalAdminPanel(chatId, topicId, page = 0) {
+      console.log(`发送全局管理员面板，chatId: ${chatId}, topicId: ${topicId}, page: ${page}`);
+      
+      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+      
+      // 获取封禁用户列表（分页）
+      const blockedUsers = await getBlockedUsers(page, 10);
+      const totalBlocked = await getTotalBlockedUsers();
+      const totalPages = Math.ceil(totalBlocked / 10);
+
+      let text = `🔧 *全局管理员面板*\n\n`;
+      text += `✅ *验证码状态*: ${verificationEnabled ? '开启' : '关闭'}\n`;
+      text += `🚫 *封禁用户数*: ${totalBlocked}\n\n`;
+
+      if (blockedUsers.length === 0) {
+        text += `📝 当前没有被封禁的用户。`;
+      } else {
+        text += `*被封禁用户列表 (${page + 1}/${totalPages || 1})*:\n`;
+        blockedUsers.forEach((user, index) => {
+          text += `${index + 1 + page * 10}. 用户ID: \`${user.chat_id}\`\n`;
+        });
+      }
+
+      const buttons = [];
+
+      // 为每个封禁用户添加解封按钮
+      blockedUsers.forEach(user => {
+        buttons.push([{
+          text: `🔓 解封 ${user.chat_id}`,
+          callback_data: `global_unblock_${user.chat_id}_${page}`
+        }]);
+      });
+
+      // 翻页按钮
+      if (totalBlocked > 10) {
+        const navButtons = [];
+        if (page > 0) {
+          navButtons.push({
+            text: '⬅️ 上一页',
+            callback_data: `global_admin_${page - 1}`
+          });
+        }
+        if (page < totalPages - 1) {
+          navButtons.push({
+            text: '下一页 ➡️',
+            callback_data: `global_admin_${page + 1}`
+          });
+        }
+        if (navButtons.length > 0) {
+          buttons.push(navButtons);
+        }
+      }
+
+      // 验证码开关按钮
+      buttons.push([
+        { 
+          text: verificationEnabled ? '🔴 关闭验证码' : '🟢 开启验证码', 
+          callback_data: `global_toggle_verification_${page}` 
+        }
+      ]);
+
+      const replyMarkup = { inline_keyboard: buttons };
+
+      // 发送或更新消息
+      const panelMessageId = adminPanelMessages.get(`${chatId}:${topicId}`);
+      
+      if (panelMessageId) {
+        // 编辑现有消息
+        console.log(`编辑现有管理员面板消息: ${panelMessageId}`);
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: panelMessageId,
+            text: text,
+            parse_mode: 'Markdown',
+            reply_markup: replyMarkup
+          })
+        });
+      } else {
+        // 发送新消息
+        console.log('发送新的管理员面板消息');
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_thread_id: topicId,
+            text: text,
+            parse_mode: 'Markdown',
+            reply_markup: replyMarkup
+          })
+        });
+        const data = await response.json();
+        if (data.ok) {
+          console.log(`管理员面板消息ID: ${data.result.message_id}`);
+          adminPanelMessages.set(`${chatId}:${topicId}`, data.result.message_id);
+        } else {
+          console.error(`发送管理员面板失败: ${JSON.stringify(data)}`);
+        }
+      }
+    }
+
+    async function getBlockedUsers(page = 0, limit = 10) {
+      const offset = page * limit;
+      const result = await env.D1.prepare('SELECT chat_id FROM user_states WHERE is_blocked = ? LIMIT ? OFFSET ?')
+        .bind(true, limit, offset)
+        .all();
+      return result.results;
+    }
+
+    async function getTotalBlockedUsers() {
+      const result = await env.D1.prepare('SELECT COUNT(*) as count FROM user_states WHERE is_blocked = ?')
+        .bind(true)
+        .first();
+      return result.count;
+    }
+
     async function validateTopic(topicId) {
       try {
         const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -553,47 +717,6 @@ export default {
       messageRateCache.set(targetChatId, undefined);
       topicIdCache.set(targetChatId, undefined);
       await sendMessageToTopic(topicId, `用户 ${targetChatId} 的状态已重置。`);
-    }
-
-    async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
-      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
-      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
-
-      const buttons = [
-        [
-          { text: '拉黑用户', callback_data: `block_${privateChatId}` },
-          { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
-        ],
-        [
-          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
-          { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
-        ],
-        [
-          { text: '删除会话', callback_data: `delete_user_${privateChatId}` }
-        ]
-      ];
-
-      const adminMessage = '管理员面板：请选择操作';
-      await Promise.all([
-        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_thread_id: topicId,
-            text: adminMessage,
-            reply_markup: { inline_keyboard: buttons }
-          })
-        }),
-        fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId
-          })
-        })
-      ]);
     }
 
     async function getVerificationSuccessMessage() {
@@ -718,6 +841,12 @@ export default {
         return;
       }
       processedCallbacks.add(callbackKey);
+
+      // 处理全局管理员面板回调
+      if (data.startsWith('global_')) {
+        await handleGlobalAdminCallback(callbackQuery);
+        return;
+      }
 
       const parts = data.split('_');
       let action;
@@ -852,7 +981,6 @@ export default {
         const isAdmin = await checkIfAdmin(senderId);
         if (!isAdmin) {
           await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
-          await sendAdminPanel(chatId, topicId, privateChatId, messageId);
           return;
         }
 
@@ -915,7 +1043,8 @@ export default {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
         }
 
-        await sendAdminPanel(chatId, topicId, privateChatId, messageId);
+        // 更新管理面板消息
+        await updateAdminPanel(chatId, topicId, privateChatId, messageId);
       }
 
       await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
@@ -925,6 +1054,93 @@ export default {
           callback_query_id: callbackQuery.id
         })
       });
+    }
+
+    async function handleGlobalAdminCallback(callbackQuery) {
+      const data = callbackQuery.data;
+      const chatId = callbackQuery.message.chat.id.toString();
+      const topicId = callbackQuery.message.message_thread_id;
+      const messageId = callbackQuery.message.message_id;
+
+      // 检查是否是管理员
+      const isAdmin = await checkIfAdmin(callbackQuery.from.id);
+      if (!isAdmin) {
+        await sendMessageToTopic(topicId, '只有管理员可以使用此功能。');
+        return;
+      }
+
+      if (data.startsWith('global_admin_')) {
+        // 翻页或刷新
+        const page = parseInt(data.split('_')[2]);
+        await sendGlobalAdminPanel(chatId, topicId, page);
+      } else if (data.startsWith('global_unblock_')) {
+        // 解封用户
+        const parts = data.split('_');
+        const userChatId = parts[2];
+        const currentPage = parseInt(parts[3]);
+        
+        // 解封用户
+        await env.D1.prepare('UPDATE user_states SET is_blocked = ?, is_first_verification = ? WHERE chat_id = ?')
+          .bind(false, true, userChatId)
+          .run();
+        
+        // 更新缓存
+        let state = userStateCache.get(userChatId);
+        if (state) {
+          state.is_blocked = false;
+          state.is_first_verification = true;
+          userStateCache.set(userChatId, state);
+        }
+
+        // 检查是否还有封禁用户
+        const totalBlocked = await getTotalBlockedUsers();
+        
+        if (totalBlocked === 0) {
+          // 如果没有封禁用户了，删除面板消息
+          await deleteMessage(chatId, messageId);
+          adminPanelMessages.delete(`${chatId}:${topicId}`);
+          await sendMessageToTopic(topicId, '✅ 所有用户已解封，管理员面板已关闭。');
+        } else {
+          // 刷新面板
+          await sendGlobalAdminPanel(chatId, topicId, currentPage);
+          await sendMessageToTopic(topicId, `✅ 用户 ${userChatId} 已解封。`);
+        }
+      } else if (data.startsWith('global_toggle_verification_')) {
+        // 切换验证码状态
+        const page = parseInt(data.split('_')[3]);
+        const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
+        const newState = !currentState;
+        
+        await setSetting('verification_enabled', newState.toString());
+        await sendMessageToTopic(topicId, `验证码功能已${newState ? '开启' : '关闭'}。`);
+        
+        // 自动刷新面板
+        await sendGlobalAdminPanel(chatId, topicId, page);
+      }
+
+      // 回答回调查询
+      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          callback_query_id: callbackQuery.id
+        })
+      });
+    }
+
+    async function deleteMessage(chatId, messageId) {
+      try {
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: messageId
+          })
+        });
+      } catch (error) {
+        console.log(`删除消息失败: ${error.message}`);
+      }
     }
 
     async function handleVerification(chatId, messageId) {
@@ -1136,7 +1352,72 @@ export default {
       const messageId = messageResponse.result.message_id;
       await pinMessage(topicId, messageId);
 
+      // 创建话题后立即发送管理面板
+      await sendAdminPanelInTopic(topicId, userId);
+
       return topicId;
+    }
+
+    async function sendAdminPanelInTopic(topicId, privateChatId) {
+      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+
+      const buttons = [
+        [
+          { text: '拉黑用户', callback_data: `block_${privateChatId}` },
+          { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
+        ],
+        [
+          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
+          { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
+        ],
+        [
+          { text: '删除会话', callback_data: `delete_user_${privateChatId}` }
+        ]
+      ];
+
+      const adminMessage = '管理员面板：请选择操作';
+      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: GROUP_ID,
+          message_thread_id: topicId,
+          text: adminMessage,
+          reply_markup: { inline_keyboard: buttons }
+        })
+      });
+    }
+
+    async function updateAdminPanel(chatId, topicId, privateChatId, messageId) {
+      const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
+      const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
+
+      const buttons = [
+        [
+          { text: '拉黑用户', callback_data: `block_${privateChatId}` },
+          { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
+        ],
+        [
+          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
+          { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
+        ],
+        [
+          { text: '删除会话', callback_data: `delete_user_${privateChatId}` }
+        ]
+      ];
+
+      const adminMessage = '管理员面板：请选择操作';
+      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          text: adminMessage,
+          reply_markup: { inline_keyboard: buttons }
+        })
+      });
     }
 
     async function saveTopicId(chatId, topicId) {
