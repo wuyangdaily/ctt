@@ -329,6 +329,18 @@ export default {
         return;
       }
 
+      // 检查是否是管理员私聊
+      const isAdmin = await checkIfAdmin(message.from.id);
+      if (isAdmin) {
+        console.log(`管理员 ${message.from.id} 私聊机器人，跳过验证和话题创建`);
+        if (text === '/start') {
+          await sendMessageToUser(chatId, "尊敬的管理员，您好！您可以直接与机器人对话，无需验证且不会创建话题。");
+        } else {
+          await sendMessageToUser(chatId, "尊敬的管理员，您的消息已收到。作为管理员，您无需验证且不会创建话题。");
+        }
+        return;
+      }
+
       let userState = userStateCache.get(chatId);
       if (userState === undefined) {
         userState = await env.D1.prepare('SELECT is_blocked, is_first_verification, is_verified, verified_expiry, is_verifying FROM user_states WHERE chat_id = ?')
