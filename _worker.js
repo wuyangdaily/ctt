@@ -592,7 +592,21 @@ export default {
 
         const replyMarkup = { inline_keyboard: buttons };
 
-        // 发送新消息（不尝试编辑，避免复杂的状态管理）
+        // 先删除旧的面板消息（如果存在）
+        const panelKey = `${chatId}:${topicId || 'default'}`;
+        const oldPanelMessageId = adminPanelMessages.get(panelKey);
+        
+        if (oldPanelMessageId) {
+          try {
+            console.log(`删除旧的管理员面板消息: ${oldPanelMessageId}`);
+            await deleteMessage(chatId, oldPanelMessageId);
+          } catch (deleteError) {
+            console.log(`删除旧面板消息失败: ${deleteError.message}`);
+            // 继续发送新消息，即使删除失败
+          }
+        }
+
+        // 发送新消息
         console.log('发送新的管理员面板消息');
         const messageBody = {
           chat_id: chatId,
@@ -616,7 +630,6 @@ export default {
         if (data.ok) {
           console.log(`管理员面板消息发送成功，消息ID: ${data.result.message_id}`);
           // 存储面板消息ID以便后续更新
-          const panelKey = `${chatId}:${topicId || 'default'}`;
           adminPanelMessages.set(panelKey, data.result.message_id);
           return true;
         } else {
