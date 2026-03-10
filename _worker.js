@@ -1068,6 +1068,24 @@ export default {
           await setSetting('user_raw_enabled', newState.toString());
           await sendMessageToTopic(topicId, `用户端 Raw 链接已${newState ? '开启' : '关闭'}。`);
         } else if (action === 'delete_user') {
+          // 获取用户的话题ID
+          const userTopicId = await getExistingTopicId(privateChatId);
+          if (userTopicId) {
+            try {
+              await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteForumTopic`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  chat_id: GROUP_ID,
+                  message_thread_id: userTopicId
+                })
+              });
+            } catch (error) {
+              console.log(`删除话题失败: ${error.message}`);
+              // 可以发送提示给管理员，但为了简洁，仅记录日志
+            }
+          }
+
           userStateCache.set(privateChatId, undefined);
           messageRateCache.set(privateChatId, undefined);
           topicIdCache.set(privateChatId, undefined);
@@ -1076,7 +1094,7 @@ export default {
             env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(privateChatId),
             env.D1.prepare('DELETE FROM chat_topic_mappings WHERE chat_id = ?').bind(privateChatId)
           ]);
-          await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
+          await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录、话题映射已删除，对应的讨论话题也已删除。`);
         } else {
           await sendMessageToTopic(topicId, `未知操作：${action}`);
         }
@@ -1424,7 +1442,7 @@ export default {
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
         ],
         [
-          { text: '删除会话', callback_data: `delete_user_${privateChatId}` }
+          { text: '结束会话', callback_data: `delete_user_${privateChatId}` }
         ]
       ];
 
@@ -1455,7 +1473,7 @@ export default {
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
         ],
         [
-          { text: '删除会话', callback_data: `delete_user_${privateChatId}` }
+          { text: '结束会话', callback_data: `delete_user_${privateChatId}` }
         ]
       ];
 
