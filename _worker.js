@@ -665,7 +665,7 @@ export default {
           }
 
           buttons.push([
-            { text: verificationEnabled ? '🔴 关闭验证码' : '🟢 开启验证码', callback_data: `global_toggle_verification_${page}` },
+            { text: verificationEnabled ? '🔴 关闭验证' : '🟢 开启验证', callback_data: `global_toggle_verification_${page}` },
             { text: '🔄 刷新', callback_data: `global_admin_${page}` },
             { text: '❌ 关闭面板', callback_data: `global_close_panel` }
           ]);
@@ -1289,7 +1289,7 @@ export default {
           { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
         ],
         [
-          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
+          { text: verificationEnabled ? '关闭验证' : '开启验证', callback_data: `toggle_verification_${privateChatId}` },
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
         ],
         [
@@ -1320,7 +1320,7 @@ export default {
           { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
         ],
         [
-          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
+          { text: verificationEnabled ? '关闭验证' : '开启验证', callback_data: `toggle_verification_${privateChatId}` },
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
         ],
         [
