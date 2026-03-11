@@ -628,12 +628,7 @@ export default {
           const [action, targetId] = confirmData.split(':');
           if (action === 'confirm_unban') {
             buttons.push([
-              { text: `✅ 确认解封 ${targetId}`, callback_data: `global_confirm_unban_${targetId}_${page}` },
-              { text: '❌ 取消', callback_data: `global_admin_${page}` }
-            ]);
-          } else if (action === 'confirm_unban_all') {
-            buttons.push([
-              { text: `✅ 确认解封全部`, callback_data: `global_confirm_unban_all_${page}` },
+              { text: `✅ 确认解封`, callback_data: `global_confirm_unban_${targetId}_${page}` },
               { text: '❌ 取消', callback_data: `global_admin_${page}` }
             ]);
           }
@@ -658,11 +653,7 @@ export default {
             }
           }
 
-          if (totalBlocked > 0) {
-            buttons.push([
-              { text: '🚫 解封全部', callback_data: `global_unban_all_confirm_${page}` }
-            ]);
-          }
+          // 已移除“解封全部”按钮
 
           buttons.push([
             { text: verificationEnabled ? '🔴 关闭验证' : '🟢 开启验证', callback_data: `global_toggle_verification_${page}` },
@@ -793,41 +784,7 @@ export default {
           } else {
             await sendGlobalAdminPanel(chatId, topicId, page, adminId);
           }
-        } else if (data.startsWith('global_unban_all_confirm_')) {
-          const page = parseInt(data.split('_')[4]);
-          await sendGlobalAdminPanel(chatId, topicId, page, adminId, `confirm_unban_all:`);
-                } else if (data.startsWith('global_confirm_unban_all_')) {
-          const page = parseInt(data.split('_')[4]);
-          const nowSeconds = Math.floor(Date.now() / 1000);
-          
-          // 执行解封操作
-          const updateResult = await env.D1.prepare(`
-            UPDATE user_states 
-            SET is_blocked = ?, failed_attempts = ?, ban_expiry = ?
-            WHERE is_blocked = ? OR (ban_expiry IS NOT NULL AND ban_expiry > ?)
-          `).bind(false, 0, null, true, nowSeconds).run();
-          
-          // 记录日志（包含影响行数）
-          await logAdminAction(adminId, 'unban_all', '', `管理员解封全部用户，影响行数: ${updateResult.meta.changes}`);
-          
-          // 清空所有缓存，确保后续读取最新数据
-          userStateCache.clear();
-          topicIdCache.clear(); // 可选，但安全起见
-          messageRateCache.clear();
-          
-          // 重新查询被封禁用户数
-          const totalBlockedAfter = await getTotalBlockedUsers(nowSeconds);
-          
-          if (totalBlockedAfter === 0) {
-            // 没有封禁用户了，删除面板消息
-            await deleteMessage(chatId, messageId);
-            adminPanelMessages.delete(`${chatId}:${topicId || 'default'}`);
-            await sendMessageToTopic(topicId, '✅ 所有用户已解封，管理员面板已关闭。');
-          } else {
-            // 仍有封禁用户（可能新被封禁的），刷新面板并提示
-            await sendGlobalAdminPanel(chatId, topicId, page, adminId);
-            await sendMessageToTopic(topicId, `⚠️ 解封操作完成，但仍有 ${totalBlockedAfter} 个用户处于封禁状态，可能是在解封过程中新被封禁的用户。`);
-          }
+        // 已移除处理 global_unban_all_confirm_ 和 global_confirm_unban_all_ 的分支
         } else if (data.startsWith('global_toggle_verification_')) {
           const page = parseInt(data.split('_')[3]);
           const currentState = (await getSetting('verification_enabled', env.D1)) === 'true';
@@ -1289,7 +1246,7 @@ export default {
           { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
         ],
         [
-          { text: verificationEnabled ? '关闭验证' : '开启验证', callback_data: `toggle_verification_${privateChatId}` },
+          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
         ],
         [
@@ -1320,7 +1277,7 @@ export default {
           { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
         ],
         [
-          { text: verificationEnabled ? '关闭验证' : '开启验证', callback_data: `toggle_verification_${privateChatId}` },
+          { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
           { text: '查询黑名单', callback_data: `check_blocklist_${privateChatId}` }
         ],
         [
